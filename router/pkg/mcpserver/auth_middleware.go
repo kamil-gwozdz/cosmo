@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
+
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 )
 
 type contextKey string
@@ -48,6 +50,8 @@ type MCPAuthMiddleware struct {
 	scopeChallengeIncludeTokenScopes bool
 	toolScopesMu                     sync.RWMutex
 	toolScopes                       map[string][][]string // toolName → OR-of-AND scope groups
+	scopeExtractorMu                 sync.RWMutex
+	scopeExtractor                   *ScopeExtractor // for runtime scope checking of execute_graphql
 }
 
 // NewMCPAuthMiddleware creates a new authentication middleware using the existing
@@ -95,6 +99,22 @@ func (m *MCPAuthMiddleware) getToolScopes(toolName string) [][]string {
 		return nil
 	}
 	return m.toolScopes[toolName]
+}
+
+// SetScopeExtractor atomically replaces the scope extractor used for
+// runtime scope checking of execute_graphql arbitrary operations.
+// Called during Reload() after the schema is loaded.
+func (m *MCPAuthMiddleware) SetScopeExtractor(extractor *ScopeExtractor) {
+	m.scopeExtractorMu.Lock()
+	defer m.scopeExtractorMu.Unlock()
+	m.scopeExtractor = extractor
+}
+
+// getScopeExtractor returns the current scope extractor (thread-safe).
+func (m *MCPAuthMiddleware) getScopeExtractor() *ScopeExtractor {
+	m.scopeExtractorMu.RLock()
+	defer m.scopeExtractorMu.RUnlock()
+	return m.scopeExtractor
 }
 
 // authenticateRequest extracts and validates the JWT token using the existing
@@ -176,7 +196,8 @@ func (m *MCPAuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 			var jsonRPCReq struct {
 				Method string `json:"method"`
 				Params struct {
-					Name string `json:"name"`
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
 				} `json:"params"`
 			}
 			if err := json.Unmarshal(body, &jsonRPCReq); err == nil && jsonRPCReq.Method != "" {
@@ -203,6 +224,17 @@ func (m *MCPAuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 							challengeScopes := BestScopeChallengeWithExisting(tokenScopes, toolOrScopes, m.scopeChallengeIncludeTokenScopes)
 							m.sendPerToolInsufficientScopeResponse(w, challengeScopes, jsonRPCReq.Params.Name)
 							return
+						}
+					}
+
+					// Runtime scope check for execute_graphql: parse the query from arguments
+					// and extract @requiresScopes at the HTTP level (proper 403 + WWW-Authenticate)
+					if jsonRPCReq.Params.Name == "execute_graphql" && len(jsonRPCReq.Params.Arguments) > 0 {
+						if extractor := m.getScopeExtractor(); extractor != nil {
+							if challengeScopes := m.checkExecuteGraphQLScopes(claims, jsonRPCReq.Params.Arguments, extractor); len(challengeScopes) > 0 {
+								m.sendPerToolInsufficientScopeResponse(w, challengeScopes, "execute_graphql")
+								return
+							}
 						}
 					}
 				}
@@ -314,6 +346,40 @@ func (m *MCPAuthMiddleware) sendPerToolInsufficientScopeResponse(w http.Response
 	w.WriteHeader(http.StatusForbidden)
 }
 
+// checkExecuteGraphQLScopes parses the GraphQL query from execute_graphql arguments,
+// extracts @requiresScopes requirements, and returns the challenge scopes if insufficient.
+// Returns nil if scopes are satisfied or the query cannot be parsed.
+func (m *MCPAuthMiddleware) checkExecuteGraphQLScopes(claims authentication.Claims, arguments json.RawMessage, extractor *ScopeExtractor) []string {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(arguments, &args); err != nil || args.Query == "" {
+		return nil
+	}
+
+	opDoc, report := astparser.ParseGraphqlDocumentString(args.Query)
+	if report.HasErrors() {
+		return nil // let the tool handler deal with parse errors
+	}
+
+	fieldReqs := extractor.ExtractScopesForOperation(&opDoc)
+	if len(fieldReqs) == 0 {
+		return nil
+	}
+
+	combinedScopes := extractor.ComputeCombinedScopes(fieldReqs)
+	if len(combinedScopes) == 0 {
+		return nil
+	}
+
+	tokenScopes := extractScopes(claims)
+	if SatisfiesAnyGroup(tokenScopes, combinedScopes) {
+		return nil
+	}
+
+	return BestScopeChallengeWithExisting(tokenScopes, combinedScopes, m.scopeChallengeIncludeTokenScopes)
+}
+
 // validateScopesForRequest checks if the token contains all required scopes
 func (m *MCPAuthMiddleware) validateScopesForRequest(claims authentication.Claims, requiredScopes []string) error {
 	// If no scopes are required, skip validation
@@ -368,14 +434,4 @@ func contains(slice []string, item string) bool {
 func GetClaimsFromContext(ctx context.Context) (authentication.Claims, bool) {
 	claims, ok := ctx.Value(userClaimsContextKey).(authentication.Claims)
 	return claims, ok
-}
-
-// extractScopesFromContext extracts OAuth scopes from the authenticated claims in context.
-// Returns an empty slice if no claims or no scopes are present.
-func extractScopesFromContext(ctx context.Context) []string {
-	claims, ok := GetClaimsFromContext(ctx)
-	if !ok {
-		return []string{}
-	}
-	return extractScopes(claims)
 }

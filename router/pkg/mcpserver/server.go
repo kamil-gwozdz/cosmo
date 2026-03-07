@@ -26,7 +26,6 @@ import (
 	"github.com/wundergraph/cosmo/router/pkg/schemaloader"
 
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astprinter"
 )
 
@@ -293,6 +292,11 @@ func NewGraphQLSchemaServer(routerGraphQLEndpoint string, opts ...func(*Options)
 		},
 		&mcp.ServerOptions{
 			PageSize: 100,
+			// Override default capabilities to disable the "logging" capability
+			// that the SDK advertises by default (for historical reasons).
+			// We don't implement logging/setLevel, so advertising it causes
+			// clients like MCP Inspector to call it and fail.
+			Capabilities: &mcp.ServerCapabilities{},
 		},
 	)
 
@@ -399,6 +403,7 @@ func WithCORS(corsCfg cors.Config) func(*Options) {
 		corsCfg.AllowOrigins = []string{"*"}
 		corsCfg.AllowMethods = []string{"GET", "PUT", "POST", "DELETE", "OPTIONS"}
 		corsCfg.AllowHeaders = append(corsCfg.AllowHeaders, "Content-Type", "Accept", "Authorization", "Last-Event-ID", "Mcp-Protocol-Version", "Mcp-Session-Id")
+		corsCfg.ExposeHeaders = append(corsCfg.ExposeHeaders, "Mcp-Session-Id", "WWW-Authenticate")
 		if corsCfg.MaxAge <= 0 {
 			corsCfg.MaxAge = 24 * time.Hour
 		}
@@ -527,10 +532,14 @@ func (s *GraphQLSchemaServer) Reload(schema *ast.Document, fieldConfigs []*nodev
 	// Compute per-tool scope requirements from @requiresScopes directives
 	if len(fieldConfigs) > 0 {
 		s.operationsManager.ComputeToolScopes(fieldConfigs)
-		// Store the extractor for runtime scope checking in execute_graphql
 		s.scopeExtractor = NewScopeExtractor(fieldConfigs, schema)
 	} else {
 		s.scopeExtractor = nil
+	}
+
+	// Pass scope extractor to auth middleware for runtime execute_graphql scope checking
+	if s.authMiddleware != nil {
+		s.authMiddleware.SetScopeExtractor(s.scopeExtractor)
 	}
 
 	s.server.RemoveTools(s.registeredTools...)
@@ -985,32 +994,6 @@ func (s *GraphQLSchemaServer) handleExecuteGraphQL() func(ctx context.Context, r
 
 		if input.Query == "" {
 			return nil, fmt.Errorf("input validation failed: query is required")
-		}
-
-		// Runtime scope checking: parse the query and check @requiresScopes
-		if s.scopeExtractor != nil {
-			opDoc, report := astparser.ParseGraphqlDocumentString(input.Query)
-			if !report.HasErrors() {
-				fieldReqs := s.scopeExtractor.ExtractScopesForOperation(&opDoc)
-				if len(fieldReqs) > 0 {
-					combinedScopes := s.scopeExtractor.ComputeCombinedScopes(fieldReqs)
-					if len(combinedScopes) > 0 {
-						tokenScopes := extractScopesFromContext(ctx)
-						if !SatisfiesAnyGroup(tokenScopes, combinedScopes) {
-							includeExisting := s.oauthConfig != nil && s.oauthConfig.ScopeChallengeIncludeTokenScopes
-							challengeScopes := BestScopeChallengeWithExisting(tokenScopes, combinedScopes, includeExisting)
-							return &mcp.CallToolResult{
-								Content: []mcp.Content{&mcp.TextContent{
-									Text: fmt.Sprintf("Insufficient scopes for this operation. Required: %s. "+
-										"Your token is missing scopes needed to access one or more fields in the query.",
-										strings.Join(challengeScopes, " ")),
-								}},
-								IsError: true,
-							}, nil
-						}
-					}
-				}
-			}
 		}
 
 		return s.executeGraphQLQuery(ctx, input.Query, input.Variables)

@@ -1,162 +1,204 @@
 package mcpserver
 
 import (
-	"context"
-	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
-	"github.com/wundergraph/cosmo/router/pkg/config"
 )
 
-func TestExecuteGraphQL_ScopeChecking(t *testing.T) {
+func TestMCPAuthMiddleware_ExecuteGraphQLScopes(t *testing.T) {
 	t.Parallel()
+
+	const testMetadataURL = "http://localhost:5025/.well-known/oauth-protected-resource/mcp"
 
 	schema := parseTestSchema(t)
 	fieldConfigs := testFieldConfigs()
 	extractor := NewScopeExtractor(fieldConfigs, &schema)
 
-	// Mock GraphQL backend that returns a simple response
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
-	}))
-	t.Cleanup(backend.Close)
-
-	makeServer := func(includeTokenScopes bool) *GraphQLSchemaServer {
-		return &GraphQLSchemaServer{
-			scopeExtractor:        extractor,
-			routerGraphQLEndpoint: backend.URL,
-			logger:                zap.NewNop(),
-			httpClient:            backend.Client(),
-			oauthConfig: &config.MCPOAuthConfiguration{
-				ScopeChallengeIncludeTokenScopes: includeTokenScopes,
-			},
-		}
+	validDecoder := &mockTokenDecoder{
+		decodeFunc: func(token string) (authentication.Claims, error) {
+			switch token {
+			case "no-extra-scopes":
+				return authentication.Claims{"sub": "user1", "scope": "mcp:connect mcp:tools:write"}, nil
+			case "has-read-fact":
+				return authentication.Claims{"sub": "user2", "scope": "mcp:connect mcp:tools:write read:fact"}, nil
+			case "has-read-all":
+				return authentication.Claims{"sub": "user3", "scope": "mcp:connect mcp:tools:write read:all"}, nil
+			case "has-read-employee":
+				return authentication.Claims{"sub": "user4", "scope": "mcp:connect mcp:tools:write read:employee"}, nil
+			case "has-read-employee-private":
+				return authentication.Claims{"sub": "user5", "scope": "mcp:connect mcp:tools:write read:employee read:private"}, nil
+			case "has-mcp-connect":
+				return authentication.Claims{"sub": "user6", "scope": "mcp:connect mcp:tools:write"}, nil
+			default:
+				return nil, errors.New("invalid token")
+			}
+		},
 	}
 
-	makeContext := func(scopes string) context.Context {
-		claims := authentication.Claims{"sub": "test-user"}
-		if scopes != "" {
-			claims["scope"] = scopes
-		}
-		return context.WithValue(context.Background(), userClaimsContextKey, claims)
+	scopes := MCPScopeConfig{
+		Initialize: []string{"mcp:connect"},
+		ToolsCall:  []string{"mcp:tools:write"},
 	}
 
-	makeRequest := func(query string) *mcp.CallToolRequest {
-		args, _ := json.Marshal(map[string]string{"query": query})
-		return &mcp.CallToolRequest{
-			Params: &mcp.CallToolParamsRaw{
-				Name:      "execute_graphql",
-				Arguments: args,
-			},
-		}
+	makeBody := func(query string) string {
+		// Escape quotes in query for JSON
+		escaped := strings.ReplaceAll(query, `"`, `\"`)
+		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_graphql","arguments":{"query":"` + escaped + `"}}}`
 	}
 
 	tests := []struct {
-		name               string
-		query              string
-		tokenScopes        string
-		includeTokenScopes bool
-		wantError          bool
-		wantContains       string
+		name                             string
+		token                            string
+		query                            string
+		scopeChallengeIncludeTokenScopes bool
+		wantStatusCode                   int
+		wantScope                        string
+		wantContains                     string
 	}{
 		{
-			name:        "unscoped query passes",
-			query:       `query { employees { id tag } }`,
-			tokenScopes: "",
-			wantError:   false,
+			name:           "unscoped query passes",
+			token:          "no-extra-scopes",
+			query:          `query { employees { id tag } }`,
+			wantStatusCode: 200,
 		},
 		{
-			name:        "scoped query with matching scope passes",
-			query:       `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
-			tokenScopes: "read:fact",
-			wantError:   false,
+			name:           "scoped query with matching scope passes",
+			token:          "has-read-fact",
+			query:          `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
+			wantStatusCode: 200,
 		},
 		{
-			name:        "scoped query with alternative scope passes",
-			query:       `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
-			tokenScopes: "read:all",
-			wantError:   false,
+			name:           "scoped query with alternative scope (read:all) passes",
+			token:          "has-read-all",
+			query:          `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
+			wantStatusCode: 200,
 		},
 		{
-			name:         "scoped query without scopes returns error with challenge",
-			query:        `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
-			tokenScopes:  "",
-			wantError:    true,
-			wantContains: "read:fact",
+			name:           "scoped query without required scope returns 403",
+			token:          "no-extra-scopes",
+			query:          `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
+			wantStatusCode: 403,
+			wantScope:      `scope="read:fact"`,
+			wantContains:   `error_description="insufficient scopes for tool execute_graphql"`,
 		},
 		{
-			name:         "employee startDate requires AND scopes",
-			query:        `query { employee(id: 1) { id startDate } }`,
-			tokenScopes:  "read:employee",
-			wantError:    true,
-			wantContains: "read:employee read:private",
+			name:           "AND scopes - token has one of two required",
+			token:          "has-read-employee",
+			query:          `query { employee(id: 1) { id startDate } }`,
+			wantStatusCode: 403,
+			wantScope:      `scope="read:employee read:private"`,
 		},
 		{
-			name:        "employee startDate with read:all passes",
-			query:       `query { employee(id: 1) { id startDate } }`,
-			tokenScopes: "read:all",
-			wantError:   false,
+			name:           "AND scopes - token satisfies full AND group",
+			token:          "has-read-employee-private",
+			query:          `query { employee(id: 1) { id startDate } }`,
+			wantStatusCode: 200,
 		},
 		{
-			name:         "empty token with AND group picks smallest group",
-			query:        `query { employee(id: 1) { id startDate } }`,
-			tokenScopes:  "",
-			wantError:    true,
-			wantContains: "read:all", // 1 missing vs 2 missing for ["read:employee", "read:private"]
+			name:           "AND scopes - read:all satisfies alternative group",
+			token:          "has-read-all",
+			query:          `query { employee(id: 1) { id startDate } }`,
+			wantStatusCode: 200,
 		},
 		{
-			name:               "include token scopes in challenge",
-			query:              `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
-			tokenScopes:        "mcp:connect",
-			includeTokenScopes: true,
-			wantError:          true,
-			wantContains:       "mcp:connect read:fact",
+			name:           "empty relevant scopes picks smallest group",
+			token:          "no-extra-scopes",
+			query:          `query { employee(id: 1) { id startDate } }`,
+			wantStatusCode: 403,
+			// Group 1: 2 missing, Group 2: 1 missing → Group 2 wins
+			wantScope: `scope="read:all"`,
 		},
 		{
-			name:        "invalid query is not scope-checked",
-			query:       `not a valid query {}`,
-			tokenScopes: "",
-			wantError:   false, // parse error means no scope check, falls through to executeGraphQLQuery
+			name:                             "include token scopes in challenge",
+			token:                            "has-mcp-connect",
+			query:                            `query { topSecretFederationFacts { ... on DirectiveFact { title } } }`,
+			scopeChallengeIncludeTokenScopes: true,
+			wantStatusCode:                   403,
+			wantScope:                        `scope="mcp:connect mcp:tools:write read:fact"`,
+		},
+		{
+			name:           "invalid query passes through (not scope-checked)",
+			token:          "no-extra-scopes",
+			query:          `not a valid query {}`,
+			wantStatusCode: 200,
+		},
+		{
+			name:           "empty query passes through",
+			token:          "no-extra-scopes",
+			query:          ``,
+			wantStatusCode: 200,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := makeServer(tt.includeTokenScopes)
-			ctx := makeContext(tt.tokenScopes)
-			handler := srv.handleExecuteGraphQL()
+			middleware, err := NewMCPAuthMiddleware(validDecoder, true, testMetadataURL, scopes, tt.scopeChallengeIncludeTokenScopes)
+			assert.NoError(t, err)
 
-			result, err := handler(ctx, makeRequest(tt.query))
+			// Set scope extractor for execute_graphql runtime checking
+			middleware.SetScopeExtractor(extractor)
 
-			if tt.wantError {
-				require.NoError(t, err, "handler should not return Go error for scope failures")
-				require.NotNil(t, result)
-				assert.True(t, result.IsError, "result should be marked as error")
-				assert.Len(t, result.Content, 1)
-				text := result.Content[0].(*mcp.TextContent).Text
-				assert.Contains(t, text, "Insufficient scopes")
-				if tt.wantContains != "" {
-					assert.Contains(t, text, tt.wantContains)
-				}
-			} else {
-				// For unscoped queries, the handler will try to call executeGraphQLQuery
-				// which will fail since we don't have a real HTTP server. That's fine —
-				// we just need to verify no scope error was returned.
-				if result != nil && result.IsError {
-					text := result.Content[0].(*mcp.TextContent).Text
-					assert.NotContains(t, text, "Insufficient scopes",
-						"should not fail with scope error")
-				}
+			handler := middleware.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+			}))
+
+			req, _ := http.NewRequest("POST", "/mcp", strings.NewReader(makeBody(tt.query)))
+			req.Header.Set("Authorization", "Bearer "+tt.token)
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			assert.Equal(t, tt.wantStatusCode, rr.Code)
+			if tt.wantScope != "" {
+				wwwAuth := rr.Header().Get("WWW-Authenticate")
+				assert.Contains(t, wwwAuth, tt.wantScope, "WWW-Authenticate header should contain expected scope")
+			}
+			if tt.wantContains != "" {
+				wwwAuth := rr.Header().Get("WWW-Authenticate")
+				assert.Contains(t, wwwAuth, tt.wantContains, "WWW-Authenticate header should contain expected string")
 			}
 		})
 	}
+}
+
+func TestMCPAuthMiddleware_ExecuteGraphQLNoExtractor(t *testing.T) {
+	t.Parallel()
+
+	const testMetadataURL = "http://localhost:5025/.well-known/oauth-protected-resource/mcp"
+
+	decoder := &mockTokenDecoder{
+		decodeFunc: func(token string) (authentication.Claims, error) {
+			return authentication.Claims{"sub": "user1", "scope": "mcp:connect mcp:tools:write"}, nil
+		},
+	}
+
+	scopes := MCPScopeConfig{
+		Initialize: []string{"mcp:connect"},
+		ToolsCall:  []string{"mcp:tools:write"},
+	}
+
+	middleware, err := NewMCPAuthMiddleware(decoder, true, testMetadataURL, scopes, false)
+	assert.NoError(t, err)
+	// Deliberately NOT setting a scope extractor
+
+	handler := middleware.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	// Scoped query should pass through when no extractor is set
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_graphql","arguments":{"query":"query { topSecretFederationFacts { ... on DirectiveFact { title } } }"}}}`
+	req, _ := http.NewRequest("POST", "/mcp", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, 200, rr.Code, "should pass through when no scope extractor is configured")
 }
