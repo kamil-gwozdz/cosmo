@@ -150,7 +150,10 @@
       "Scopes": {
         "Initialize": null,
         "ToolsList": null,
-        "ToolsCall": null
+        "ToolsCall": null,
+        "ExecuteGraphQL": null,
+        "GetOperationInfo": null,
+        "GetSchema": null
       },
       "ScopeChallengeIncludeTokenScopes": false
     }

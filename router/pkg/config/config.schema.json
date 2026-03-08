@@ -2366,6 +2366,21 @@
                   "type": "array",
                   "description": "Scopes required for the tools/call MCP method (any tool).",
                   "items": { "type": "string" }
+                },
+                "execute_graphql": {
+                  "type": "array",
+                  "description": "Scopes required to call the execute_graphql built-in tool. Additive to tools_call scopes. Only relevant when enable_arbitrary_operations is true.",
+                  "items": { "type": "string" }
+                },
+                "get_operation_info": {
+                  "type": "array",
+                  "description": "Scopes required to call the get_operation_info built-in tool. Additive to tools_call scopes.",
+                  "items": { "type": "string" }
+                },
+                "get_schema": {
+                  "type": "array",
+                  "description": "Scopes required to call the get_schema built-in tool. Additive to tools_call scopes. Only relevant when expose_schema is true.",
+                  "items": { "type": "string" }
                 }
               }
             },

@@ -598,3 +598,111 @@ func TestMCPAuthMiddleware_MethodLevelScopes(t *testing.T) {
 		})
 	}
 }
+
+func TestMCPAuthMiddleware_BuiltinToolScopes(t *testing.T) {
+	t.Parallel()
+
+	const testMetadataURL = "http://localhost:5025/.well-known/oauth-protected-resource/mcp"
+
+	validDecoder := &mockTokenDecoder{
+		decodeFunc: func(token string) (authentication.Claims, error) {
+			switch token {
+			case "base-only":
+				return authentication.Claims{"sub": "user1", "scope": "mcp:connect mcp:tools:call"}, nil
+			case "has-schema-read":
+				return authentication.Claims{"sub": "user2", "scope": "mcp:connect mcp:tools:call mcp:schema:read"}, nil
+			case "has-graphql-execute":
+				return authentication.Claims{"sub": "user3", "scope": "mcp:connect mcp:tools:call mcp:graphql:execute"}, nil
+			case "has-ops-read":
+				return authentication.Claims{"sub": "user4", "scope": "mcp:connect mcp:tools:call mcp:ops:read"}, nil
+			default:
+				return nil, errors.New("invalid token")
+			}
+		},
+	}
+
+	scopes := MCPScopeConfig{
+		Initialize:       []string{"mcp:connect"},
+		ToolsCall:        []string{"mcp:tools:call"},
+		ExecuteGraphQL:   []string{"mcp:graphql:execute"},
+		GetOperationInfo: []string{"mcp:ops:read"},
+		GetSchema:        []string{"mcp:schema:read"},
+	}
+
+	tests := []struct {
+		name           string
+		token          string
+		body           string
+		wantStatusCode int
+		wantScope      string
+	}{
+		{
+			name:           "execute_graphql without required scope returns 403",
+			token:          "base-only",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_graphql"}}`,
+			wantStatusCode: 403,
+			wantScope:      `scope="mcp:graphql:execute"`,
+		},
+		{
+			name:           "execute_graphql with required scope passes",
+			token:          "has-graphql-execute",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_graphql"}}`,
+			wantStatusCode: 200,
+		},
+		{
+			name:           "get_schema without required scope returns 403",
+			token:          "base-only",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_schema"}}`,
+			wantStatusCode: 403,
+			wantScope:      `scope="mcp:schema:read"`,
+		},
+		{
+			name:           "get_schema with required scope passes",
+			token:          "has-schema-read",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_schema"}}`,
+			wantStatusCode: 200,
+		},
+		{
+			name:           "get_operation_info without required scope returns 403",
+			token:          "base-only",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_operation_info"}}`,
+			wantStatusCode: 403,
+			wantScope:      `scope="mcp:ops:read"`,
+		},
+		{
+			name:           "get_operation_info with required scope passes",
+			token:          "has-ops-read",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_operation_info"}}`,
+			wantStatusCode: 200,
+		},
+		{
+			name:           "non-builtin tool is not affected by builtin scopes",
+			token:          "base-only",
+			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_operation_get_users"}}`,
+			wantStatusCode: 200,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			middleware, err := NewMCPAuthMiddleware(validDecoder, true, testMetadataURL, scopes, false)
+			assert.NoError(t, err)
+
+			handler := middleware.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+			}))
+
+			req, _ := http.NewRequest("POST", "/mcp", strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+tt.token)
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			assert.Equal(t, tt.wantStatusCode, rr.Code)
+			if tt.wantScope != "" {
+				wwwAuth := rr.Header().Get("WWW-Authenticate")
+				assert.Contains(t, wwwAuth, tt.wantScope, "WWW-Authenticate header should contain expected scope")
+			}
+		})
+	}
+}

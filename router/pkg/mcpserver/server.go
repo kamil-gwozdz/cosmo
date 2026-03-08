@@ -266,9 +266,12 @@ func NewGraphQLSchemaServer(routerGraphQLEndpoint string, opts ...func(*Options)
 		// - tools_list: scopes required for tools/list method
 		// - tools_call: scopes required for tools/call method (any tool)
 		scopeConfig := MCPScopeConfig{
-			Initialize: options.OAuthConfig.Scopes.Initialize,
-			ToolsList:  options.OAuthConfig.Scopes.ToolsList,
-			ToolsCall:  options.OAuthConfig.Scopes.ToolsCall,
+			Initialize:       options.OAuthConfig.Scopes.Initialize,
+			ToolsList:        options.OAuthConfig.Scopes.ToolsList,
+			ToolsCall:        options.OAuthConfig.Scopes.ToolsCall,
+			ExecuteGraphQL:   options.OAuthConfig.Scopes.ExecuteGraphQL,
+			GetOperationInfo: options.OAuthConfig.Scopes.GetOperationInfo,
+			GetSchema:        options.OAuthConfig.Scopes.GetSchema,
 		}
 		authMiddleware, err = NewMCPAuthMiddleware(tokenDecoder, true, resourceMetadataURL, scopeConfig, options.OAuthConfig.ScopeChallengeIncludeTokenScopes)
 		if err != nil {
@@ -1063,11 +1066,22 @@ func (s *GraphQLSchemaServer) handleProtectedResourceMetadata(w http.ResponseWri
 	// Build scopes_supported from all configured scopes (union across all levels)
 	// plus all scopes extracted from @requiresScopes directives on operations
 	scopesSet := make(map[string]bool)
-	for _, scopeList := range [][]string{
+	// Collect all static scope lists, conditionally including built-in tool scopes
+	// based on whether the corresponding feature is enabled
+	scopeLists := [][]string{
 		s.oauthConfig.Scopes.Initialize,
 		s.oauthConfig.Scopes.ToolsList,
 		s.oauthConfig.Scopes.ToolsCall,
-	} {
+		s.oauthConfig.Scopes.GetOperationInfo, // get_operation_info is always available
+	}
+	if s.enableArbitraryOperations {
+		scopeLists = append(scopeLists, s.oauthConfig.Scopes.ExecuteGraphQL)
+	}
+	if s.exposeSchema {
+		scopeLists = append(scopeLists, s.oauthConfig.Scopes.GetSchema)
+	}
+
+	for _, scopeList := range scopeLists {
 		for _, scope := range scopeList {
 			scopesSet[scope] = true
 		}

@@ -1062,6 +1062,15 @@ type MCPOAuthScopesConfiguration struct {
 	ToolsList []string `yaml:"tools_list,omitempty"`
 	// ToolsCall specifies scopes required for the tools/call MCP method (any tool).
 	ToolsCall []string `yaml:"tools_call,omitempty"`
+	// ExecuteGraphQL specifies scopes required to call the execute_graphql built-in tool.
+	// Additive to tools_call scopes. Only relevant when enable_arbitrary_operations is true.
+	ExecuteGraphQL []string `yaml:"execute_graphql,omitempty"`
+	// GetOperationInfo specifies scopes required to call the get_operation_info built-in tool.
+	// Additive to tools_call scopes.
+	GetOperationInfo []string `yaml:"get_operation_info,omitempty"`
+	// GetSchema specifies scopes required to call the get_schema built-in tool.
+	// Additive to tools_call scopes. Only relevant when expose_schema is true.
+	GetSchema []string `yaml:"get_schema,omitempty"`
 }
 
 type MCPSessionConfig struct {

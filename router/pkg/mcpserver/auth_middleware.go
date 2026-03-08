@@ -36,9 +36,12 @@ func (p *mcpAuthProvider) AuthenticationHeaders() http.Header {
 
 // MCPScopeConfig holds the structured scope requirements for MCP operations.
 type MCPScopeConfig struct {
-	Initialize []string // Scopes required for all HTTP requests
-	ToolsList  []string // Scopes required for tools/list
-	ToolsCall  []string // Scopes required for tools/call (any tool)
+	Initialize       []string // Scopes required for all HTTP requests
+	ToolsList        []string // Scopes required for tools/list
+	ToolsCall        []string // Scopes required for tools/call (any tool)
+	ExecuteGraphQL   []string // Scopes required for the execute_graphql built-in tool
+	GetOperationInfo []string // Scopes required for the get_operation_info built-in tool
+	GetSchema        []string // Scopes required for the get_schema built-in tool
 }
 
 // MCPAuthMiddleware creates authentication middleware for MCP tools and resources
@@ -99,6 +102,21 @@ func (m *MCPAuthMiddleware) getToolScopes(toolName string) [][]string {
 		return nil
 	}
 	return m.toolScopes[toolName]
+}
+
+// getBuiltinToolScopes returns the configured scopes for a built-in tool.
+// Returns nil if the tool is not a built-in or has no configured scopes.
+func (m *MCPAuthMiddleware) getBuiltinToolScopes(toolName string) []string {
+	switch toolName {
+	case "execute_graphql":
+		return m.scopes.ExecuteGraphQL
+	case "get_operation_info":
+		return m.scopes.GetOperationInfo
+	case "get_schema":
+		return m.scopes.GetSchema
+	default:
+		return nil
+	}
 }
 
 // SetScopeExtractor atomically replaces the scope extractor used for
@@ -213,6 +231,16 @@ func (m *MCPAuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 					if err := m.validateScopesForRequest(claims, methodScopes); err != nil {
 						m.sendInsufficientScopeResponse(w, methodScopes, claims, err)
 						return
+					}
+				}
+
+				// Built-in tool scope check (additive to tools_call gate)
+				if jsonRPCReq.Method == "tools/call" && jsonRPCReq.Params.Name != "" {
+					if builtinScopes := m.getBuiltinToolScopes(jsonRPCReq.Params.Name); len(builtinScopes) > 0 {
+						if err := m.validateScopesForRequest(claims, builtinScopes); err != nil {
+							m.sendInsufficientScopeResponse(w, builtinScopes, claims, err)
+							return
+						}
 					}
 				}
 
